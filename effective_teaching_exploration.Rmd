@@ -1,0 +1,217 @@
+---
+title: "Access to Effective Teaching Exploration"
+output: html_document
+author: Team Arrow
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r load libraries}
+library(data.table)
+library(ggplot2)
+library(sf)
+library(tigris)
+library(plotly)
+library(viridis)
+library(ggExtra)
+```
+
+
+# Kentucky
+## Data processing
+
+```{r KY load data}
+# school location https://data-nces.opendata.arcgis.com/search?groupIds=455147561fd3416daa180395fb4e9237
+# updated annually
+in_school_location <- fread("./data/Public_School_Locations_2019-20.csv", colClasses = "character")
+
+# effective teaching data
+# downloadable at https://www.education.ky.gov/Open-House/data/HistoricalDatasets/average_years_school_experience_2020.csv
+in_exp_data <- fread("./data/average_years_school_experience_2020.csv", colClass = "character") 
+
+# student race data
+# downloadable at https://www.education.ky.gov/Open-House/data/HistoricalDatasets/primary_enrollment_2020.csv
+in_race_data <- fread("./data/primary_enrollment_2020.csv", colClass = "character")
+```
+
+```{r KY merge location + target data}
+# subset to fields of interest
+school_location <- in_school_location[, .(NCESSCH, LAT, LON)]
+
+# merge on school id 
+merged_data <- merge(in_exp_data, school_location,
+                     by.x = "NCES ID", by.y = "NCESSCH",
+                     all.x = TRUE)
+
+# drop rows w/o school id, they're district level data
+merged_data <- subset(merged_data, `NCES ID` != "")
+
+# check: any school w/o latitude/longitude?
+no_location_schools <- merged_data[is.na(LAT) | is.na(LON)]
+if(nrow(no_location_schools) > 0) {
+  warning("check NA location")
+  print(no_location_schools)
+}
+
+# drop schools w/o LAT/LON, can't plot them on the map
+merged_data <- subset(merged_data, !is.na(LAT) & !is.na(LON))
+
+# convert col type
+merged_data[, `AVERAGE YEARS OF EXPERIENCE` := as.numeric(`AVERAGE YEARS OF EXPERIENCE`)]
+```
+
+```{r KY start map, results= 'hide'}
+# convert to map object
+map_df <- st_as_sf(merged_data, coords = c("LON", "LAT"), crs = 4326)
+
+# obtain state/district boundary from tigris
+states_sf <- as.data.table(states(cb = TRUE, year = 2020))
+state_sf <- states_sf[NAME == "Kentucky"]
+
+districts_sf <- as.data.table(school_districts(cb = TRUE, year = 2020))
+district_sf <- districts_sf[STATE_NAME == "Kentucky"]
+```
+
+
+## Map plot
+
+```{r KY map plot}
+# plot
+map_plot <- ggplot() +
+  # state boundary
+  geom_sf(data = st_as_sf(state_sf), fill = "gray95", color = "gray40") +
+  # district boundary overlay
+  geom_sf(data = st_as_sf(district_sf), fill = NA, color = "#E1A685", size = 0.3, alpha = 0.5) + 
+   geom_point(data = merged_data,
+             aes(x = as.numeric(LON), y = as.numeric(LAT),
+                 size = as.numeric(`EDUCATOR COUNT`),
+                 color = `AVERAGE YEARS OF EXPERIENCE`,
+                 text = paste(
+                   "School name: ", `SCHOOL NAME`,
+                   "\nDistrict name: ", `DISTRICT NAME`,
+                   "\nEducator count: ", `EDUCATOR COUNT`,
+                   "\nAvg yrs of exp:", `AVERAGE YEARS OF EXPERIENCE`)), alpha = 0.7) +
+  scale_color_viridis_c(option = "D") +
+  labs(x = NULL, y = NULL)
+
+# make plotly
+(map_plotly <- ggplotly(map_plot, tooltip = "text"))
+```
+
+
+
+## Student race data processing
+```{r KY process race data}
+# take the vars we need
+race_data <- in_race_data[, .(`DISTRICT NAME`, `SCHOOL NAME`, `NCES ID`, `DEMOGRAPHIC`, `TOTAL STUDENT COUNT`)]
+
+# keep school level data only (the ones with NCES SCHOOL ID)
+race_data <- subset(race_data, `NCES ID` != "")
+
+# make cols numeric
+race_data[, `TOTAL STUDENT COUNT` := as.numeric(`TOTAL STUDENT COUNT`)]
+
+# keep student race demographic count only
+race_cats <- c('African American','American Indian or Alaska Native','Asian','Hispanic or Latino','Native Hawaiian or Pacific Islander','Two or More Races','White (non-Hispanic)')
+
+race_data <- subset(race_data, DEMOGRAPHIC %chin% c(race_cats, "All Students"))
+
+
+race_data_wide <- dcast.data.table(race_data, 
+                   as.formula("`DISTRICT NAME` + `SCHOOL NAME` + `NCES ID` ~ DEMOGRAPHIC"),
+                   value.var = "TOTAL STUDENT COUNT")
+race_data_wide[, pct_african_american_student := `African American`/`All Students` * 100]
+
+# merge two datasets
+merged_race_effective_teaching <- merge(race_data_wide, merged_data, 
+                                        c("DISTRICT NAME", "SCHOOL NAME", "NCES ID"), all = TRUE)
+
+```
+
+
+## Scatter plot of race
+```{r KY plot race and teacher exp}
+merged_race_effective_teaching[, jefferson_county := ifelse(`DISTRICT NAME` == "Jefferson County", "1", "0")]
+(race_teaching_ggplot <- ggplot(merged_race_effective_teaching, aes(x = `pct_african_american_student`, y = `AVERAGE YEARS OF EXPERIENCE`, color = jefferson_county)) +
+   geom_point() +
+   geom_smooth(method = "lm", fill = NA) +
+   geom_smooth(data = merged_race_effective_teaching[jefferson_county == 1], method = "lm", fill = NA) +
+    labs(title = "Average Yrs of Teacher Experience ~ Pct of AA Students"))
+
+race_teaching_ggplot_w_text <- ggplot(merged_race_effective_teaching, aes(x = `pct_african_american_student`, y = `AVERAGE YEARS OF EXPERIENCE`, color = jefferson_county, text = paste(
+    "School name: ", `SCHOOL NAME`,
+    "\nDistrict name: ", `DISTRICT NAME`,
+    "\nEducator count: ", `EDUCATOR COUNT`,
+    "\nAvg yrs of exp:", `AVERAGE YEARS OF EXPERIENCE`))) +
+   geom_point() +
+   geom_smooth(method = "lm", fill = NA) +
+   geom_smooth(data = merged_race_effective_teaching[jefferson_county == 1], method = "lm", fill = NA) 
+
+# plots w/ marginal dist
+race_teaching_ggplot_w_marginal <- ggMarginal(race_teaching_ggplot, type = "density", groupColour = TRUE, groupFill = TRUE)
+
+# plotly version
+(race_teaching_plotly <- ggplotly(race_teaching_ggplot_w_text, tooltip = "text") %>%
+    layout(title = list(text = "Average Yrs of Teacher Experience ~ Pct of AA Students")))
+
+# future step: remove non A1 schools; only A1 schools are included in accountability reporting
+  
+```
+
+
+# Ohio
+## Load data
+```{r OH load data}
+# teacher data downloadable at https://eduprdreportcardstorage1.blob.core.windows.net/data-download-2022/BLDG_LRC_2022_EDUCATOR_DATA.xlsx?sv=2020-08-04&ss=b&srt=sco&sp=rlx&se=2031-07-28T05:10:18Z&st=2021-07-27T21:10:18Z&spr=https&sig=nPOvW%2Br2caitHi%2F8WhYwU7xqalHo0dFrudeJq%2B%2Bmyuo%3D
+in_effective_teaching_oh <- as.data.table(readxl::read_excel("./data/BLDG_LRC_2022_EDUCATOR_DATA.xlsx",
+                                               sheet = 2))
+
+# student data downloadable at https://eduprdreportcardstorage1.blob.core.windows.net/data-download-2022/21-22_Achievement_Building.xlsx?sv=2020-08-04&ss=b&srt=sco&sp=rlx&se=2031-07-28T05:10:18Z&st=2021-07-27T21:10:18Z&spr=https&sig=nPOvW%2Br2caitHi%2F8WhYwU7xqalHo0dFrudeJq%2B%2Bmyuo%3D
+in_student_performance_oh <- as.data.table(readxl::read_excel("./data/21-22_Achievement_Building.xlsx",
+                                               sheet = 2))
+```
+
+## Clean data
+
+```{r OH clean teacher and student data}
+# select cols of interest
+effective_teaching_oh <- in_effective_teaching_oh[, .(`Building IRN`, `Building Name`, `District Name`,
+                                                        `Percent of Teachers Inexperienced`,
+                                                      `Number of Full Time Teachers (FTE)`)]
+effective_teaching_oh[, `percent_of_inexperienced_teacher` := as.numeric(`Percent of Teachers Inexperienced`)]
+
+
+student_performance_oh <- in_student_performance_oh[, .(`Building IRN`, `Building Name`, `District Name`, `Performance Index Percent 2021-2022`)]
+student_performance_oh[, `performance_index_percent` := as.numeric(`Performance Index Percent 2021-2022`)]
+
+# merge teacher data and student performance data
+merged_data_oh <- merge(effective_teaching_oh, student_performance_oh,
+                        c("Building IRN", "Building Name", "District Name"),
+                        all = TRUE)
+
+```
+
+## Scatter plot
+
+```{r OH plot}
+merged_data_oh[, columbus_city_sd := ifelse(`District Name` == "Columbus City School District", "1", "0")]
+(effective_teaching_performance_plot <- ggplot(merged_data_oh, aes(x = percent_of_inexperienced_teacher, y = performance_index_percent,
+                           color = columbus_city_sd)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", fill = NA) +
+  labs(title = "Performance Index Pct ~ Pct of Inexperienced Teachers"))
+```
+
+# Save
+```{r}
+htmlwidgets::saveWidget(map_plotly, "./plots/kentucky_avg_teacher_exp_map.html")
+ggsave(race_teaching_ggplot_w_marginal, filename = "./plots/kentucky_avg_teacher_exp_student_group.png")
+htmlwidgets::saveWidget(race_teaching_plotly, "./plots/kentucky_race_teaching_interactive.html")
+ggsave(effective_teaching_performance_plot, filename = "./plots/ohio_pct_inexperienced_teacher_student_performance.png")
+```
+
+
